@@ -1,16 +1,23 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch, nextTick } from 'vue';
+import { onMounted, onUnmounted, ref, watch, nextTick, onUpdated } from 'vue';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { useDroneStore } from '../store/drone';
+import type { Waypoint } from '../types';
 
 const store = useDroneStore();
 const mapContainer = ref<HTMLElement>();
 let map: L.Map | null = null;
 let waypointLayer: L.LayerGroup | null = null;
 let routeLayer: L.Polyline | null = null;
+let suggestedRouteLayer: L.Polyline | null = null;
 let zoneLayer: L.LayerGroup | null = null;
+let highlightedZoneLayer: L.LayerGroup | null = null;
 let droneMarker: L.CircleMarker | null = null;
+let dangerWaypointLayer: L.LayerGroup | null = null;
+
+let flashAnimationFrame: number | null = null;
+let flashState = 0;
 
 const addMode = ref(false);
 
@@ -24,6 +31,8 @@ function initMap() {
 
   waypointLayer = L.layerGroup().addTo(map);
   zoneLayer = L.layerGroup().addTo(map);
+  highlightedZoneLayer = L.layerGroup().addTo(map);
+  dangerWaypointLayer = L.layerGroup().addTo(map);
 
   map.on('click', (e: L.LeafletMouseEvent) => {
     if (addMode.value) {
@@ -32,40 +41,113 @@ function initMap() {
   });
 }
 
+function getZoneColor(type: string) {
+  return type === 'airport' ? '#ef4444' :
+         type === 'military' ? '#f97316' : '#a855f7';
+}
+
+function getRiskColor(severity?: string) {
+  switch (severity) {
+    case 'critical': return '#dc2626';
+    case 'high': return '#ea580c';
+    case 'medium': return '#d97706';
+    default: return '#65a30d';
+  }
+}
+
 function drawNoFlyZones() {
   if (!zoneLayer) return;
   zoneLayer.clearLayers();
   for (const zone of store.noFlyZones) {
-    const color =
-      zone.type === 'airport' ? '#ef4444' :
-      zone.type === 'military' ? '#f97316' : '#a855f7';
-    L.circle([zone.center[0], zone.center[1]], {
+    const color = getZoneColor(zone.type);
+    const lat = zone.centerLat ?? zone.center[0];
+    const lng = zone.centerLng ?? zone.center[1];
+    const circle = L.circle([lat, lng], {
       radius: zone.radius,
-      color,
+      color: color,
       fillColor: color,
-      fillOpacity: 0.15,
-      weight: 2,
-    })
-      .bindPopup(`<b>${zone.name}</b><br>Type: ${zone.type}<br>Radius: ${zone.radius}m`)
-      .addTo(zoneLayer);
+      fillOpacity: zone.temporary ? 0.25 : 0.15,
+      weight: zone.temporary ? 3 : 2,
+      dashArray: zone.temporary ? '10,5' : undefined,
+    });
+    circle.bindPopup(`
+      <div style="min-width:180px">
+        <b>${zone.name}</b>${zone.temporary ? ' <span style="color:#ef4444;font-weight:bold">[临时]</span>' : ''}<br>
+        Type: ${zone.type}<br>
+        Radius: ${zone.radius}m
+      </div>
+    `);
+    circle.addTo(zoneLayer);
+  }
+}
+
+function drawHighlightedZones() {
+  if (!highlightedZoneLayer || !map) return;
+  highlightedZoneLayer.clearLayers();
+
+  for (const zoneId of store.highlightedZoneIds) {
+    const zone = store.noFlyZones.find(z => z.id === zoneId);
+    if (!zone) continue;
+
+    const lat = zone.centerLat ?? zone.center[0];
+    const lng = zone.centerLng ?? zone.center[1];
+    const color = getZoneColor(zone.type);
+
+    const pulseCircle = L.circle([lat, lng], {
+      radius: zone.radius * 1.2,
+      color: color,
+      fillColor: color,
+      fillOpacity: 0.1 + Math.sin(flashState * 0.1) * 0.15,
+      weight: 4,
+      opacity: 0.8 + Math.sin(flashState * 0.1) * 0.2,
+    });
+    pulseCircle.addTo(highlightedZoneLayer);
+
+    const innerCircle = L.circle([lat, lng], {
+      radius: zone.radius,
+      color: '#fef08a',
+      fillColor: 'transparent',
+      fillOpacity: 0,
+      weight: 3,
+      opacity: 0.9 + Math.sin(flashState * 0.15) * 0.1,
+      dashArray: '5,5',
+    });
+    innerCircle.addTo(highlightedZoneLayer);
+  }
+
+  flashState++;
+  if (store.highlightedZoneIds.size > 0) {
+    flashAnimationFrame = requestAnimationFrame(drawHighlightedZones);
+  } else if (flashAnimationFrame) {
+    cancelAnimationFrame(flashAnimationFrame);
+    flashAnimationFrame = null;
   }
 }
 
 function drawWaypoints() {
   if (!waypointLayer) return;
   waypointLayer.clearLayers();
+
+  const dangerIndices = new Set<number>();
+  if (store.riskAssessment) {
+    for (const cz of store.riskAssessment.conflictZones) {
+      cz.affectedWaypointIndices.forEach(i => dangerIndices.add(i));
+    }
+  }
+
   store.waypoints.forEach((wp, idx) => {
+    const isDanger = dangerIndices.has(idx);
     const marker = L.circleMarker([wp.lat, wp.lng], {
-      radius: 8,
-      color: '#3b82f6',
-      fillColor: '#60a5fa',
+      radius: isDanger ? 10 : 8,
+      color: isDanger ? '#dc2626' : '#3b82f6',
+      fillColor: isDanger ? '#ef4444' : '#60a5fa',
       fillOpacity: 0.9,
-      weight: 2,
+      weight: isDanger ? 3 : 2,
     });
     marker.bindTooltip(`WP${idx + 1}`, { permanent: true, direction: 'top', className: 'wp-tooltip' });
     marker.bindPopup(`
       <div style="min-width:160px">
-        <b>Waypoint ${idx + 1}</b><br>
+        <b>Waypoint ${idx + 1}</b>${isDanger ? ' <span style="color:#ef4444">⚠️</span>' : ''}<br>
         Altitude: ${wp.altitude}m<br>
         Speed: ${wp.speed} m/s<br>
         Action: ${wp.action}<br>
@@ -89,23 +171,70 @@ function drawRoute() {
 
   const latlngs = store.waypoints.map((w) => [w.lat, w.lng] as [number, number]);
 
-  // Check near obstacles for coloring
-  let hasDanger = false;
-  for (const wp of store.waypoints) {
-    for (const zone of store.noFlyZones) {
-      const d = Math.sqrt(
-        (wp.lat - zone.center[0]) ** 2 + (wp.lng - zone.center[1]) ** 2
-      ) * 111000;
-      if (d < zone.radius * 1.5) hasDanger = true;
+  let routeColor = '#22c55e';
+  let dashArray: string | undefined = undefined;
+
+  if (store.riskAssessment) {
+    switch (store.riskAssessment.overallRisk) {
+      case 'critical':
+        routeColor = '#dc2626';
+        dashArray = '10,5';
+        break;
+      case 'warning':
+        routeColor = '#ea580c';
+        dashArray = '8,4';
+        break;
+      case 'caution':
+        routeColor = '#d97706';
+        break;
     }
+  } else {
+    let hasDanger = false;
+    for (const wp of store.waypoints) {
+      for (const zone of store.noFlyZones) {
+        const lat = zone.centerLat ?? zone.center[0];
+        const lng = zone.centerLng ?? zone.center[1];
+        const d = Math.sqrt((wp.lat - lat) ** 2 + (wp.lng - lng) ** 2) * 111000;
+        if (d < zone.radius * 1.5) hasDanger = true;
+      }
+    }
+    if (hasDanger) routeColor = '#ef4444';
   }
 
   routeLayer = L.polyline(latlngs, {
-    color: hasDanger ? '#ef4444' : '#22c55e',
+    color: routeColor,
     weight: 3,
     opacity: 0.8,
-    dashArray: hasDanger ? '8,4' : undefined,
+    dashArray,
   }).addTo(map);
+}
+
+function drawSuggestedRoute() {
+  if (suggestedRouteLayer && map) {
+    map.removeLayer(suggestedRouteLayer);
+    suggestedRouteLayer = null;
+  }
+  if (!store.suggestedRoutePreview || store.suggestedRoutePreview.length < 2 || !map) return;
+
+  const latlngs = store.suggestedRoutePreview.map((w) => [w.lat, w.lng] as [number, number]);
+  suggestedRouteLayer = L.polyline(latlngs, {
+    color: '#22c55e',
+    weight: 4,
+    opacity: 0.7,
+    dashArray: '15,10',
+  }).addTo(map);
+
+  store.suggestedRoutePreview.forEach((wp, idx) => {
+    const marker = L.circleMarker([wp.lat, wp.lng], {
+      radius: 6,
+      color: '#22c55e',
+      fillColor: '#86efac',
+      fillOpacity: 0.7,
+      weight: 2,
+    });
+    marker.bindTooltip(`建议 WP${idx + 1}`, { direction: 'top', className: 'wp-tooltip' });
+    marker.addTo(waypointLayer!);
+  });
 }
 
 function drawSimDrone() {
@@ -132,13 +261,46 @@ function drawSimDrone() {
   }
 }
 
+function redrawAll() {
+  drawNoFlyZones();
+  drawWaypoints();
+  drawRoute();
+  drawSuggestedRoute();
+  if (store.highlightedZoneIds.size > 0) {
+    drawHighlightedZones();
+  }
+}
+
 watch(() => store.waypoints.length, () => {
+  drawWaypoints();
+  drawRoute();
+  store.assessCurrentRisk();
+});
+
+watch(() => store.noFlyZones.length, () => {
+  redrawAll();
+});
+
+watch(() => store.simProgress, drawSimDrone);
+
+watch(() => store.highlightedZoneIds.size, () => {
+  if (store.highlightedZoneIds.size > 0) {
+    drawHighlightedZones();
+  } else if (flashAnimationFrame) {
+    cancelAnimationFrame(flashAnimationFrame);
+    flashAnimationFrame = null;
+    if (highlightedZoneLayer) highlightedZoneLayer.clearLayers();
+  }
+});
+
+watch(() => store.riskAssessment, () => {
   drawWaypoints();
   drawRoute();
 });
 
-watch(() => store.noFlyZones.length, drawNoFlyZones);
-watch(() => store.simProgress, drawSimDrone);
+watch(() => store.suggestedRoutePreview, () => {
+  drawSuggestedRoute();
+});
 
 onMounted(() => {
   nextTick(initMap);
@@ -148,6 +310,9 @@ onUnmounted(() => {
   if (map) {
     map.remove();
     map = null;
+  }
+  if (flashAnimationFrame) {
+    cancelAnimationFrame(flashAnimationFrame);
   }
 });
 
@@ -160,6 +325,7 @@ function handlePlanRoute() {
   const first = store.waypoints[0];
   const last = store.waypoints[store.waypoints.length - 1];
   store.planRoute([first.lat, first.lng], [last.lat, last.lng]);
+  setTimeout(() => store.assessCurrentRisk(), 100);
 }
 </script>
 

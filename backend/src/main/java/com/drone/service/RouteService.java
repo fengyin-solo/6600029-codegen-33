@@ -1,18 +1,26 @@
 package com.drone.service;
 
+import com.drone.model.NoFlyZone;
+import com.drone.model.NoFlyNotification;
+import com.drone.model.RiskAssessment;
+import com.drone.model.RerouteSuggestion;
 import com.drone.model.Waypoint;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 @Service
 public class RouteService {
+
+    private final List<NoFlyZone> dynamicNoFlyZones = new CopyOnWriteArrayList<>();
+    private final List<NoFlyNotification> notifications = new CopyOnWriteArrayList<>();
 
     // ─── A* Pathfinding (simplified server-side) ────────────────────────────
     public List<Waypoint> planRoute(double startLat, double startLng,
                                      double goalLat, double goalLng,
                                      String algorithm) {
-        List<double[]> noFlyZones = getMockNoFlyZoneCoords();
+        List<NoFlyZone> allZones = getAllNoFlyZones();
         List<Waypoint> path = new ArrayList<>();
 
         // Simple grid-based A*
@@ -41,13 +49,13 @@ public class RouteService {
         for (int[] row : parent) Arrays.fill(row, -1);
 
         boolean[][] blocked = new boolean[gridSize][gridSize];
-        for (double[] zone : noFlyZones) {
+        for (NoFlyZone zone : allZones) {
             for (int r = 0; r < gridSize; r++) {
                 for (int c = 0; c < gridSize; c++) {
                     double lat = minLat + r * dLat;
                     double lng = minLng + c * dLng;
-                    double dist = haversine(lat, lng, zone[0], zone[1]);
-                    if (dist < zone[2]) blocked[r][c] = true;
+                    double dist = haversine(lat, lng, zone.getCenterLat(), zone.getCenterLng());
+                    if (dist < zone.getRadius()) blocked[r][c] = true;
                 }
             }
         }
@@ -121,24 +129,21 @@ public class RouteService {
         return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     }
 
-    // ─── Mock Data ──────────────────────────────────────────────────────────
+    // ─── Mock Data (Compatibility) ──────────────────────────────────────────
     public List<Map<String, Object>> getNoFlyZones() {
         List<Map<String, Object>> zones = new ArrayList<>();
-        zones.add(Map.of("id", "nfz-1", "name", "首都国际机场",
-                "center", List.of(40.0799, 116.6031), "radius", 8000, "type", "airport"));
-        zones.add(Map.of("id", "nfz-2", "name", "南苑军事区",
-                "center", List.of(39.7833, 116.3833), "radius", 5000, "type", "military"));
-        zones.add(Map.of("id", "nfz-3", "name", "中南海限制区",
-                "center", List.of(39.9139, 116.3741), "radius", 3000, "type", "restricted"));
+        for (NoFlyZone zone : getAllNoFlyZones()) {
+            zones.add(Map.of(
+                    "id", zone.getId(),
+                    "name", zone.getName(),
+                    "center", List.of(zone.getCenterLat(), zone.getCenterLng()),
+                    "radius", zone.getRadius(),
+                    "type", zone.getType(),
+                    "temporary", zone.isTemporary(),
+                    "createdAt", zone.getCreatedAt()
+            ));
+        }
         return zones;
-    }
-
-    private List<double[]> getMockNoFlyZoneCoords() {
-        return List.of(
-            new double[]{40.0799, 116.6031, 8000},
-            new double[]{39.7833, 116.3833, 5000},
-            new double[]{39.9139, 116.3741, 3000}
-        );
     }
 
     public List<Map<String, Object>> getTerrain() {
@@ -181,5 +186,272 @@ public class RouteService {
         }
         sb.append("  </Document>\n</kml>");
         return sb.toString();
+    }
+
+    // ─── Dynamic No-Fly Zone Management ──────────────────────────────────────
+    public List<NoFlyZone> getAllNoFlyZones() {
+        List<NoFlyZone> allZones = new ArrayList<>();
+        allZones.addAll(getStaticNoFlyZones());
+        allZones.addAll(dynamicNoFlyZones);
+        return allZones;
+    }
+
+    public List<NoFlyZone> getDynamicNoFlyZones() {
+        return new ArrayList<>(dynamicNoFlyZones);
+    }
+
+    private List<NoFlyZone> getStaticNoFlyZones() {
+        List<NoFlyZone> zones = new ArrayList<>();
+        zones.add(createZone("nfz-1", "首都国际机场", 40.0799, 116.6031, 8000, "airport", false));
+        zones.add(createZone("nfz-2", "南苑军事区", 39.7833, 116.3833, 5000, "military", false));
+        zones.add(createZone("nfz-3", "中南海限制区", 39.9139, 116.3741, 3000, "restricted", false));
+        return zones;
+    }
+
+    private NoFlyZone createZone(String id, String name, double lat, double lng, double radius, String type, boolean temp) {
+        NoFlyZone zone = new NoFlyZone(id, name, lat, lng, radius, type);
+        zone.setTemporary(temp);
+        return zone;
+    }
+
+    public NoFlyNotification addTemporaryNoFlyZone(NoFlyZone zone) {
+        zone.setTemporary(true);
+        zone.setId("temp-" + System.currentTimeMillis());
+        zone.setCreatedAt(System.currentTimeMillis());
+        dynamicNoFlyZones.add(zone);
+
+        String severity = zone.getRadius() > 4000 ? "critical" : "warning";
+        String title = "突发禁飞通知";
+        String message = String.format("在 %s 附近新增临时%s，半径 %.0f 米，请立即规避！",
+                zone.getName(), getZoneTypeName(zone.getType()), zone.getRadius());
+
+        NoFlyNotification notification = new NoFlyNotification(
+                "notif-" + System.currentTimeMillis(),
+                title,
+                message,
+                severity,
+                zone
+        );
+        notifications.add(notification);
+        return notification;
+    }
+
+    private String getZoneTypeName(String type) {
+        return switch (type) {
+            case "airport" -> "机场限制区";
+            case "military" -> "军事管制区";
+            case "restricted" -> "飞行限制区";
+            default -> "禁飞区";
+        };
+    }
+
+    public boolean removeTemporaryNoFlyZone(String zoneId) {
+        return dynamicNoFlyZones.removeIf(z -> z.getId().equals(zoneId));
+    }
+
+    public List<NoFlyNotification> getNotifications() {
+        return new ArrayList<>(notifications);
+    }
+
+    public boolean acknowledgeNotification(String notificationId) {
+        for (NoFlyNotification n : notifications) {
+            if (n.getId().equals(notificationId)) {
+                n.setAcknowledged(true);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ─── Conflict Detection ──────────────────────────────────────────────────
+    public RiskAssessment assessRisk(List<Waypoint> waypoints) {
+        List<String> warnings = new ArrayList<>();
+        List<RiskAssessment.ConflictZone> conflictZones = new ArrayList<>();
+        double maxRiskScore = 0;
+        String overallRisk = "safe";
+
+        List<NoFlyZone> allZones = getAllNoFlyZones();
+
+        for (NoFlyZone zone : allZones) {
+            List<Integer> affectedIndices = new ArrayList<>();
+            double minDistance = Double.MAX_VALUE;
+            boolean insideZone = false;
+
+            for (int i = 0; i < waypoints.size(); i++) {
+                Waypoint wp = waypoints.get(i);
+                double distance = haversine(wp.getLat(), wp.getLng(), zone.getCenterLat(), zone.getCenterLng());
+                minDistance = Math.min(minDistance, distance);
+
+                if (distance < zone.getRadius()) {
+                    insideZone = true;
+                    affectedIndices.add(i);
+                } else if (distance < zone.getRadius() * 1.5) {
+                    affectedIndices.add(i);
+                }
+            }
+
+            if (!affectedIndices.isEmpty()) {
+                String severity;
+                double riskScore;
+
+                if (insideZone) {
+                    severity = "critical";
+                    riskScore = 100;
+                    warnings.add(String.format("航线穿越%s禁飞区！", zone.getName()));
+                } else if (minDistance < zone.getRadius() * 1.2) {
+                    severity = "high";
+                    riskScore = 70;
+                    warnings.add(String.format("航线距离%s过近，存在风险！", zone.getName()));
+                } else {
+                    severity = "medium";
+                    riskScore = 40;
+                    warnings.add(String.format("航线靠近%s，请保持警惕。", zone.getName()));
+                }
+
+                maxRiskScore = Math.max(maxRiskScore, riskScore);
+                conflictZones.add(new RiskAssessment.ConflictZone(
+                        zone.getId(),
+                        zone.getName(),
+                        minDistance,
+                        severity,
+                        affectedIndices
+                ));
+            }
+        }
+
+        if (maxRiskScore >= 80) overallRisk = "critical";
+        else if (maxRiskScore >= 50) overallRisk = "warning";
+        else if (maxRiskScore >= 20) overallRisk = "caution";
+
+        return new RiskAssessment(overallRisk, warnings, conflictZones, maxRiskScore);
+    }
+
+    // ─── Reroute Suggestion ──────────────────────────────────────────────────
+    public List<RerouteSuggestion> generateRerouteSuggestions(List<Waypoint> waypoints) {
+        List<RerouteSuggestion> suggestions = new ArrayList<>();
+        RiskAssessment currentRisk = assessRisk(waypoints);
+
+        if (currentRisk.getOverallRisk().equals("safe") || waypoints.size() < 2) {
+            return suggestions;
+        }
+
+        for (RiskAssessment.ConflictZone conflict : currentRisk.getConflictZones()) {
+            if (conflict.getSeverity().equals("critical") || conflict.getSeverity().equals("high")) {
+                RerouteSuggestion suggestion = createRerouteAroundConflict(waypoints, conflict);
+                if (suggestion != null) {
+                    suggestions.add(suggestion);
+                }
+            }
+        }
+
+        if (suggestions.isEmpty() && currentRisk.getConflictZones().size() > 0) {
+            List<Waypoint> replanned = fullReplan(waypoints);
+            if (replanned != null && replanned.size() >= 2) {
+                double origDist = calculateTotalDistance(waypoints);
+                double newDist = calculateTotalDistance(replanned);
+                RiskAssessment newRisk = assessRisk(replanned);
+
+                suggestions.add(new RerouteSuggestion(
+                        "全局重新规划",
+                        replanned,
+                        Math.max(0, origDist - newDist),
+                        Math.abs(origDist - newDist) / 10,
+                        currentRisk.getRiskScore() - newRisk.getRiskScore(),
+                        "原航线存在不可接受的风险，已重新规划安全航线"
+                ));
+            }
+        }
+
+        return suggestions;
+    }
+
+    private RerouteSuggestion createRerouteAroundConflict(List<Waypoint> waypoints, RiskAssessment.ConflictZone conflict) {
+        if (conflict.getAffectedWaypointIndices().isEmpty()) return null;
+
+        int firstAffected = conflict.getAffectedWaypointIndices().get(0);
+        int lastAffected = conflict.getAffectedWaypointIndices().get(conflict.getAffectedWaypointIndices().size() - 1);
+
+        if (firstAffected <= 0 || lastAffected >= waypoints.size() - 1) return null;
+
+        List<Waypoint> newPath = new ArrayList<>();
+
+        for (int i = 0; i < firstAffected; i++) {
+            newPath.add(waypoints.get(i));
+        }
+
+        Waypoint before = waypoints.get(firstAffected - 1);
+        Waypoint after = waypoints.get(lastAffected + 1);
+
+        NoFlyZone zone = findZoneById(conflict.getZoneId());
+        if (zone == null) return null;
+
+        double midLat = (before.getLat() + after.getLat()) / 2;
+        double midLng = (before.getLng() + after.getLng()) / 2;
+
+        double latOffset = (midLat - zone.getCenterLat()) * 0.5;
+        double lngOffset = (midLng - zone.getCenterLng()) * 0.5;
+
+        double safeDist = zone.getRadius() * 2 / 111000;
+        if (Math.abs(latOffset) < safeDist && Math.abs(lngOffset) < safeDist) {
+            if (Math.abs(latOffset) > Math.abs(lngOffset)) {
+                latOffset = Math.signum(latOffset) * safeDist;
+            } else {
+                lngOffset = Math.signum(lngOffset) * safeDist;
+            }
+        }
+
+        newPath.add(new Waypoint(
+                "wp-detour-1",
+                zone.getCenterLat() + latOffset,
+                zone.getCenterLng() + lngOffset,
+                Math.max(before.getAltitude(), after.getAltitude()),
+                Math.min(before.getSpeed(), after.getSpeed()),
+                "none"
+        ));
+
+        for (int i = lastAffected + 1; i < waypoints.size(); i++) {
+            newPath.add(waypoints.get(i));
+        }
+
+        double origDist = calculateSegmentDistance(waypoints, firstAffected - 1, lastAffected + 1);
+        double newDist = calculateSegmentDistance(newPath, firstAffected - 1, newPath.size() - 1);
+
+        RiskAssessment newRisk = assessRisk(newPath);
+
+        return new RerouteSuggestion(
+                "绕行 " + conflict.getZoneName(),
+                newPath,
+                Math.max(0, origDist - newDist),
+                Math.abs(origDist - newDist) / 10,
+                conflict.getSeverity().equals("critical") ? 100 : 70,
+                String.format("通过绕行%s避开冲突区域", conflict.getZoneName())
+        );
+    }
+
+    private List<Waypoint> fullReplan(List<Waypoint> waypoints) {
+        Waypoint start = waypoints.get(0);
+        Waypoint end = waypoints.get(waypoints.size() - 1);
+        return planRoute(start.getLat(), start.getLng(), end.getLat(), end.getLng(), "astar");
+    }
+
+    private double calculateSegmentDistance(List<Waypoint> waypoints, int start, int end) {
+        double distance = 0;
+        for (int i = start; i < end && i < waypoints.size() - 1; i++) {
+            Waypoint a = waypoints.get(i);
+            Waypoint b = waypoints.get(i + 1);
+            distance += haversine(a.getLat(), a.getLng(), b.getLat(), b.getLng());
+        }
+        return distance;
+    }
+
+    private double calculateTotalDistance(List<Waypoint> waypoints) {
+        return calculateSegmentDistance(waypoints, 0, waypoints.size() - 1);
+    }
+
+    private NoFlyZone findZoneById(String zoneId) {
+        for (NoFlyZone zone : getAllNoFlyZones()) {
+            if (zone.getId().equals(zoneId)) return zone;
+        }
+        return null;
     }
 }

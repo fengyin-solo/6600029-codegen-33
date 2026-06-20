@@ -1,14 +1,27 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { onMounted, onUnmounted } from 'vue';
 import MapView from './components/MapView.vue';
 import TerrainProfile from './components/TerrainProfile.vue';
 import FlightStats from './components/FlightStats.vue';
+import NotificationToast from './components/NotificationToast.vue';
+import RerouteSuggestion from './components/RerouteSuggestion.vue';
 import { useDroneStore } from './store/drone';
 
 const store = useDroneStore();
 
+const testScenarios = [
+  { name: '测试1: 机场附近临时管制', lat: 39.92, lng: 116.42, radius: 4000, type: 'restricted' as const },
+  { name: '测试2: 大型活动管制', lat: 39.90, lng: 116.40, radius: 2500, type: 'airport' as const },
+  { name: '测试3: 军事演习区域', lat: 39.88, lng: 116.43, radius: 3500, type: 'military' as const },
+];
+
 onMounted(() => {
   store.loadMockData();
+  store.startNotificationPolling();
+});
+
+onUnmounted(() => {
+  store.stopNotificationPolling();
 });
 
 function handlePlanRoute() {
@@ -16,6 +29,22 @@ function handlePlanRoute() {
   const first = store.waypoints[0];
   const last = store.waypoints[store.waypoints.length - 1];
   store.planRoute([first.lat, first.lng], [last.lat, last.lng]);
+  setTimeout(() => store.assessCurrentRisk(), 100);
+}
+
+async function triggerTestNotification(scenario: typeof testScenarios[0]) {
+  await store.addTemporaryNoFlyZone({
+    name: scenario.name,
+    lat: scenario.lat,
+    lng: scenario.lng,
+    radius: scenario.radius,
+    type: scenario.type,
+  });
+}
+
+function handleManualRiskAssess() {
+  store.assessCurrentRisk();
+  store.fetchRerouteSuggestions();
 }
 </script>
 
@@ -26,9 +55,24 @@ function handlePlanRoute() {
       <h1 class="text-lg font-bold text-sky-400">
         🛸 无人机 3D 航线规划与地形避障
       </h1>
-      <div class="text-xs text-slate-500">
-        航点: {{ store.waypoints.length }} |
-        禁区: {{ store.noFlyZones.length }}
+      <div class="flex items-center gap-4">
+        <div
+          v-if="store.riskAssessment && store.riskAssessment.overallRisk !== 'safe'"
+          :class="[
+            'px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1',
+            store.riskAssessment.overallRisk === 'critical' ? 'bg-red-600 animate-pulse' :
+            store.riskAssessment.overallRisk === 'warning' ? 'bg-orange-500' : 'bg-yellow-500'
+          ]"
+        >
+          <span>{{ store.riskAssessment.overallRisk === 'critical' ? '🚨' : store.riskAssessment.overallRisk === 'warning' ? '⚠️' : '🔶' }}</span>
+          <span>风险: {{ store.riskAssessment.overallRisk === 'critical' ? '危险' : store.riskAssessment.overallRisk === 'warning' ? '警告' : '注意' }}</span>
+          <span class="opacity-80">{{ store.riskAssessment.riskScore.toFixed(0) }}</span>
+        </div>
+        <div class="text-xs text-slate-500">
+          航点: {{ store.waypoints.length }} |
+          禁区: {{ store.noFlyZones.length }} |
+          通知: {{ store.unacknowledgedNotifications.length }}
+        </div>
       </div>
     </header>
 
@@ -117,9 +161,39 @@ function handlePlanRoute() {
           </button>
         </div>
 
+        <!-- Emergency Test Section -->
+        <div class="bg-slate-800 rounded-lg p-3 space-y-2">
+          <h3 class="text-xs font-semibold text-slate-300 mb-2">🚨 突发禁飞测试</h3>
+          <p class="text-[10px] text-slate-400 mb-2">点击下方按钮模拟收到突发禁飞通知</p>
+          <div class="space-y-1.5">
+            <button
+              v-for="scenario in testScenarios"
+              :key="scenario.name"
+              @click="triggerTestNotification(scenario)"
+              class="w-full py-1.5 px-2 rounded text-[10px] font-medium bg-red-900/60 hover:bg-red-800 text-white text-left transition flex items-center justify-between"
+            >
+              <span>{{ scenario.name }}</span>
+              <span class="text-red-300">R{{ scenario.radius }}m</span>
+            </button>
+          </div>
+          <button
+            @click="handleManualRiskAssess"
+            :disabled="store.waypoints.length < 2"
+            class="w-full py-1.5 rounded text-[10px] font-medium bg-slate-700 hover:bg-slate-600 text-slate-300 transition disabled:opacity-40"
+          >
+            🔍 手动评估风险
+          </button>
+        </div>
+
         <!-- Flight stats -->
         <FlightStats />
       </div>
     </div>
+
+    <!-- Notification Toast -->
+    <NotificationToast />
+
+    <!-- Reroute Suggestion Panel -->
+    <RerouteSuggestion />
   </div>
 </template>
